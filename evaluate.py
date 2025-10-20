@@ -22,6 +22,7 @@ else:
 try:
     if torch.backends.mps.is_available():
         device = "mps"
+        print("Using MPS backend")
 except:  # noqa: E722
     pass
 
@@ -37,11 +38,11 @@ def main(
     def evaluate(
             instruction,
             input=None,
-            temperature=0.1,
-            top_p=0.75,
-            top_k=40,
-            num_beams=4,
-            max_new_tokens=256,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            num_beams=args.num_beams,
+            max_new_tokens=args.max_new_tokens,
             **kwargs,
     ):
         prompt = generate_prompt(instruction, input)
@@ -61,7 +62,8 @@ def main(
                 return_dict_in_generate=True,
                 output_scores=True,
                 max_new_tokens=max_new_tokens,
-                use_cache=False,
+                use_cache=True,
+                pad_token_id=tokenizer.eos_token_id,
             )
         s = generation_output.sequences[0]
         output = tokenizer.decode(s)
@@ -84,12 +86,13 @@ def main(
         print("Response:", evaluate(instruction))
         print()
     """
-    save_file = f'experiment/{args.model}-{args.adapter}-{args.dataset}.json'
+    save_file = f'experiment/{args.save_dir}/{args.dataset}.json'
     create_dir('experiment/')
+    create_dir(f'experiment/{args.save_dir}/')
 
     dataset = load_data(args)
     tokenizer, model = load_model(args)
-    total = len(dataset)
+    total = min(len(dataset), args.limit)
     correct = 0
     miss = 0.001
     output_data = []
@@ -119,16 +122,29 @@ def main(
         output_data.append(new_data)
         print(' ')
         print('---------------')
-        print(outputs)
+        print("instruction:", instruction)
+        print('---------------')
+        print("outputs:", outputs)
         print('prediction:', predict)
         print('label:', label)
         print('---------------')
-        print(f'\rtest:{idx + 1}/{total} | accuracy {correct}  {correct / (idx + 1)}')
+        print(f'\rtest:{idx + 1}/{total} | accuracy {correct}/{idx+1} : {correct / (idx + 1)}')
         with open(save_file, 'w+') as f:
             json.dump(output_data, f, indent=4)
         pbar.update(1)
+        if idx + 1 >= total:
+            break
     pbar.close()
     print('\n')
+    # save final results
+    with open(f"experiment/{args.save_dir}/results_{args.dataset}.json", 'w+') as f:
+        json.dump({
+            'accuracy': correct / total,
+            'correct': correct,
+            'total': total
+        }, f, indent=4)
+
+    print(f'final accuracy: {correct} / {total} = {correct / total}')
     print('test finished')
 
 
@@ -180,12 +196,15 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', choices=['AddSub', 'MultiArith', 'SingleEq', 'gsm8k', 'AQuA', 'SVAMP'],
                         required=True)
-    parser.add_argument('--model', choices=['LLaMA-7B', 'BLOOM-7B', 'GPT-j-6B'], required=True)
-    parser.add_argument('--adapter', choices=['LoRA', 'AdapterP', 'AdapterH', 'Parallel', 'Prefix'],
-                        required=True)
+    parser.add_argument('--save_dir', default='eval', required=True)
     parser.add_argument('--base_model', required=True)
-    parser.add_argument('--lora_weights', required=True)
-    parser.add_argument('--load_8bit', action='store_true', default=False)
+    parser.add_argument('--lora_weights', required=False)
+    parser.add_argument('--limit', type=int, default=10000)
+    parser.add_argument('--temperature', type=float, default=0.1)
+    parser.add_argument('--top_p', type=float, default=0.75)
+    parser.add_argument('--top_k', type=int, default=40)
+    parser.add_argument('--num_beams', type=int, default=4)
+    parser.add_argument('--max_new_tokens', type=int, default=512)
 
     return parser.parse_args()
 
@@ -200,73 +219,34 @@ def load_model(args) -> tuple:
         tuple(tokenizer, model)
     """
     base_model = args.base_model
-    if not base_model:
-        raise ValueError(f'can not find base model name by the value: {args.model}')
     lora_weights = args.lora_weights
-    if not lora_weights:
-        raise ValueError(f'can not find lora weight, the value is: {lora_weights}')
 
-    load_8bit = args.load_8bit
-    if args.model == 'LLaMA-7B':
-        tokenizer = LlamaTokenizer.from_pretrained(base_model)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
-    if device == "cuda":
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            load_in_8bit=load_8bit,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True,
-        ) # fix zwq
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        trust_remote_code=True,
+    ) # fix zwq
+    if lora_weights is not None:
         model = PeftModel.from_pretrained(
             model,
             lora_weights,
             torch_dtype=torch.float16,
             device_map={"":0}
         )
-    elif device == "mps":
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            device_map={"": device},
-            torch_dtype=torch.float16,
-        )
-        model = PeftModel.from_pretrained(
-            model,
-            lora_weights,
-            device_map={"": device},
-            torch_dtype=torch.float16,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model, device_map={"": device}, low_cpu_mem_usage=True
-        )
-        model = PeftModel.from_pretrained(
-            model,
-            lora_weights,
-            device_map={"": device},
-        )
+    # import pdb; pdb.set_trace()
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    model.config.pad_token_id = tokenizer.eos_token_id
+    model.config.bos_token_id = tokenizer.bos_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
 
-        # unwind broken decapoda-research config
-        model.config.pad_token_id = tokenizer.pad_token_id = 0  # unk
-        model.config.bos_token_id = 1
-        model.config.eos_token_id = 2
+    model.eval()
 
-        if not load_8bit:
-            model.half()  # seems to fix bugs for some users.
-
-        model.eval()
-        if torch.__version__ >= "2" and sys.platform != "win32":
-            model = torch.compile(model)
 
     return tokenizer, model
-
-
-def load_instruction(args) -> str:
-    instruction = ''
-    if not instruction:
-        raise ValueError('instruct not initialized')
-    return instruction
 
 
 def extract_answer_number(args, sentence: str) -> float:
