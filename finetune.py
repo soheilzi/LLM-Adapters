@@ -59,13 +59,13 @@ def train(
         # prefix tuning hyperparams
         num_virtual_tokens: int = 30,
         # llm hyperparams
-        train_on_inputs: bool = True,  # if False, masks out inputs in loss
+        train_on_inputs: bool = False,  # if False, masks out inputs in loss
         group_by_length: bool = False,  # faster, but produces an odd training loss curve
         # wandb params
         wandb_project: str = "",
         wandb_run_name: str = "",
         wandb_watch: str = "",  # options: false | gradients | all
-        wandb_log_model: str = "",  # options: false | true
+        wandb_log_model: str = "false",  # options: false | true
         resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
 ):
     print(
@@ -124,6 +124,7 @@ def train(
     if len(wandb_log_model) > 0:
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
 
+    hf_token = os.environ.get("HF_TOKEN", "")
     if load_8bit:
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
@@ -135,26 +136,34 @@ def train(
     else:
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
-            load_in_8bit=False,
-            torch_dtype=torch.float16,
-            device_map={"": int(os.environ.get("LOCAL_RANK") or 0)},
+            dtype=torch.float16,
+            device_map=device_map,
             trust_remote_code=True,
         )
 
-    if model.config.model_type == "llama":
-        # Due to the name of transformers' LlamaTokenizer, we have to do this
-        tokenizer = LlamaTokenizer.from_pretrained(base_model)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+    
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
 
-    tokenizer.pad_token_id = (
-        0  # unk. we want this to be different from the eos token
-    )
-    tokenizer.padding_side = "left"  # Allow batched inference
+    # Properly set pad token - for left padding, prefer UNK token over EOS
+    if tokenizer.pad_token is None:
+        # For left padding, UNK token is often better than EOS token
+        # as it doesn't create semantic confusion at sequence start
+        if hasattr(tokenizer, 'unk_token') and tokenizer.unk_token is not None:
+            tokenizer.pad_token = tokenizer.unk_token
+            tokenizer.pad_token_id = tokenizer.unk_token_id
+        else:
+            # Fallback to EOS token if no UNK token available
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    # Ensure model config matches tokenizer
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.bos_token_id = tokenizer.bos_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"  # Left padding for causal LM inference (generation)
 
     def tokenize(prompt, add_eos_token=True):
-        # there's probably a way to do this with the tokenizer settings
-        # but again, gotta move fast
+        # Tokenize the prompt with proper settings
         result = tokenizer(
             prompt,
             truncation=True,
@@ -162,6 +171,8 @@ def train(
             padding=False,
             return_tensors=None,
         )
+        
+        # Add EOS token if needed and not already present
         if (
                 result["input_ids"][-1] != tokenizer.eos_token_id
                 and len(result["input_ids"]) < cutoff_len
@@ -171,8 +182,10 @@ def train(
             if "chatglm" not in base_model:
                 result["attention_mask"].append(1)
 
+        # Copy input_ids to labels for causal LM training
         result["labels"] = result["input_ids"].copy()
 
+        # Return appropriate format based on model type
         if "chatglm" in base_model:
             return {"input_ids": result["input_ids"], "labels": result["labels"]}
         else:
@@ -283,7 +296,7 @@ def train(
             fp16=True,
             logging_steps=10,
             optim="adamw_torch",
-            evaluation_strategy="steps" if val_set_size > 0 else "no",
+            eval_strategy="steps" if val_set_size > 0 else "no",
             save_strategy="steps",
             eval_steps=eval_step if val_set_size > 0 else None,
             save_steps=save_step,
@@ -292,7 +305,7 @@ def train(
             load_best_model_at_end=True if val_set_size > 0 else False,
             ddp_find_unused_parameters=False if ddp else None,
             group_by_length=group_by_length,
-            report_to="wandb" if use_wandb else None,
+            report_to="wandb" if use_wandb else "none",
             run_name=wandb_run_name if use_wandb else None,
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(
